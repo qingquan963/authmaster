@@ -1,0 +1,631 @@
+# Phase 2-6：Auth SDK（对外 API SDK）
+
+> **本节版本：** v1.4（第6轮修订）
+> **本轮修订内容：** Redis 持久化 + 原子性 + 配额重置机制 + 幂等性标注扩展 + Token 阈值梯度化
+
+## 1. 概述
+
+### 1.1 背景
+
+AuthMaster 作为企业级 IAM 系统，需要对第三方应用、集成商、ISV 提供标准化的认证授权 API。直接暴露 HTTP API 存在以下问题：开发者需要自行处理签名、加密、错误重试；无法保证 SDK 版本与后端 API 版本同步；不同语言/框架的开发者接入成本高。
+
+### 1.2 设计目标
+
+| 能力 | 说明 |
+|------|------|
+| **多语言 SDK** | 提供 Python、JavaScript/TypeScript、Java、Go、PHP 官方 SDK |
+| **完整文档** | OpenAPI 3.1 规范 + SDK 内嵌使用示例 |
+| **API 限流** | 客户端侧限流 + 服务端配额管理 |
+| **错误处理** | 统一错误码体系 + 自动重试（ idempotent 操作） |
+| **安全传输** | 所有请求强制 HTTPS，敏感操作可选 App Secret 签名 |
+
+---
+
+## 2. 核心功能
+
+### 2.1 SDK 能力矩阵
+
+| 功能 | Python | JS/TS | Java | Go | PHP |
+|------|--------|-------|------|----|----|
+| 认证（登录/登出/MFA） | Y | Y | Y | Y | Y |
+| Token 管理 | Y | Y | Y | Y | Y |
+| 用户管理 CRUD | Y | Y | Y | Y | Y |
+| 角色/权限管理 | Y | Y | Y | Y | Y |
+| OAuth2/OIDC | Y | Y | Y | Y | Y |
+| SAML SP | Y | Y | Y | Y | Y |
+| ABAC 策略 | Y | Y | Y | Y | Y |
+| 限流/配额 | Y | Y | Y | Y | Y |
+| Webhook 事件 | Y | Y | Y | Y | Y |
+
+---
+
+## 3. API 设计
+
+### 3.1 API Key 认证
+
+所有 SDK 请求通过 HTTP Header 认证：
+
+```
+Authorization: Bearer <access_token>
+X-API-Key: ak_xxxxxxxxxxxx
+X-API-Signature: <HMAC-SHA256 signature>
+X-Timestamp: <Unix epoch seconds>
+```
+
+### 3.2 核心 API 端点 + 幂等性标注
+
+#### 认证类
+
+| 方法 | 路径 | 说明 | 幂等性 |
+|------|------|------|--------|
+| POST | `/api/v1/sdk/auth/login` | 账号密码登录 | **非幂等** |
+| POST | `/api/v1/sdk/auth/mfa/verify` | MFA 验证 | **非幂等** |
+| POST | `/api/v1/sdk/auth/logout` | 登出 | 幂等 |
+| POST | `/api/v1/sdk/auth/refresh` | 刷新 Token | 幂等（Token Rotation） |
+| GET | `/api/v1/sdk/auth/session` | 获取当前会话信息 | 幂等 |
+
+#### 用户管理类
+
+| 方法 | 路径 | 说明 | 幂等性 |
+|------|------|------|--------|
+| GET | `/api/v1/sdk/users` | 列出用户（分页） | 幂等 |
+| POST | `/api/v1/sdk/users` | 创建用户 | 幂等（Idempotency-Key） |
+| GET | `/api/v1/sdk/users/{id}` | 获取用户详情 | 幂等 |
+| PUT | `/api/v1/sdk/users/{id}` | 全量更新用户 | 幂等（Idempotency-Key） |
+| PATCH | `/api/v1/sdk/users/{id}` | 部分更新用户 | **非幂等** |
+| DELETE | `/api/v1/sdk/users/{id}` | 删除用户 | 幂等 |
+
+#### 角色权限类
+
+| 方法 | 路径 | 说明 | 幂等性 |
+|------|------|------|--------|
+| GET | `/api/v1/sdk/roles` | 列出角色 | 幂等 |
+| POST | `/api/v1/sdk/roles` | 创建角色 | 幂等（Idempotency-Key） |
+| POST | `/api/v1/sdk/roles/{id}/permissions` | 分配权限 | 幂等 |
+| DELETE | `/api/v1/sdk/roles/{id}/permissions/{perm}` | 移除权限 | 幂等 |
+| DELETE | `/api/v1/sdk/roles/{id}` | 删除角色 | 幂等 |
+
+#### 配额管理类
+
+| 方法 | 路径 | 说明 | 幂等性 |
+|------|------|------|--------|
+| GET | `/api/v1/sdk/quota` | 查询当前配额使用情况 | 幂等 |
+| GET | `/api/v1/sdk/quota/usage` | 查询日/周/月使用量详情 | 幂等 |
+
+### 3.3 Idempotency-Key 支持范围（[修复4] 扩展）
+
+扩展支持所有非幂等写操作（不仅是 create）：
+
+| 操作 | Idempotency-Key 示例 | 说明 |
+|------|---------------------|------|
+| `POST /users` | `create_user:{username}` | 用户创建 |
+| `PUT /users/{id}` | `update_user:{user_id}:{etag}` | 用户全量更新（含 ETag） |
+| `PATCH /users/{id}` | `patch_user:{user_id}:{field_set}` | 部分更新 |
+| `DELETE /users/{id}` | `delete_user:{user_id}` | 删除（防止重复点击） |
+| `POST /roles/{id}/permissions` | `assign_perm:{role_id}:{permission}` | 权限分配 |
+| `POST /auth/login` | `login:{username}:{device_fp}` | 登录（防止重放） |
+| `POST /auth/logout` | `logout:{session_id}` | 登出 |
+
+**Idempotency-Key 存储（Redis）：**
+
+```
+idempotency:{sha256(key)}  →  { status: "processing"|"done", response_body, status_code }
+TTL: 86400s（24小时）
+```
+
+**处理流程：**
+- 首次请求：正常响应，结果存入 Redis（status="done"）
+- 重复请求（Key 存在且 status="done"）：返回已缓存的响应
+- Key 存在且 status="processing"：返回 `409 Idempotency_Conflict`
+
+### 3.4 统一错误响应格式
+
+```json
+{
+  "error": {
+    "code": "RATE_LIMIT_EXCEEDED",
+    "message": "请求频率超出限制，请降低调用频率",
+    "details": {
+      "limit": 100,
+      "remaining": 0,
+      "reset_at": "2026-04-03T08:00:00Z",
+      "retry_after_seconds": 30
+    },
+    "request_id": "req_xxxxxxxxxxxx"
+  }
+}
+```
+
+### 3.5 公共错误结构 `ErrorDetail`
+
+所有 API 错误响应统一使用以下 Pydantic schema：
+
+```python
+class ErrorDetail(BaseModel):
+    """公共错误结构，所有 API 错误响应统一使用此结构"""
+    code: str                          # 错误码，如 ACCOUNT_LOCKED, VALIDATION_ERROR
+    message: str                       # 用户友好的中文提示
+    details: Optional[dict[str, Any]]  # 错误上下文（如推荐重试时间、字段错误列表等）
+    request_id: Optional[str]          # 请求追踪 ID，可选
+```
+
+### 3.6 错误码体系
+
+| 错误码 | HTTP 状态码 | 说明 | SDK 处理 |
+|--------|------------|------|---------|
+| `INVALID_CREDENTIALS` | 401 | 账号或密码错误 | 不重试 |
+| `TOKEN_EXPIRED` | 401 | Access Token 过期 | 自动刷新 |
+| `REFRESH_TOKEN_EXPIRED` | 401 | Refresh Token 过期 | 需重新登录 |
+| `MFA_REQUIRED` | 403 | 需要 MFA 验证 | 触发 MFA 流程 |
+| `PERMISSION_DENIED` | 403 | 无权限 | 不重试 |
+| `NOT_FOUND` | 404 | 资源不存在 | 不重试 |
+| `RATE_LIMIT_EXCEEDED` | 429 | 请求频率超限 | 自动退避重试 |
+| `QUOTA_EXCEEDED` | 429 | 月度配额用尽 | 升级套餐或等待 |
+| `VALIDATION_ERROR` | 422 | 请求参数错误 | 不重试 |
+| `INTERNAL_ERROR` | 500 | 服务端错误 | 自动重试 |
+| `SERVER_UNAVAILABLE` | 503 | 服务不可用 | 自动重试 |
+| `IDEMPOTENCY_CONFLICT` | 409 | Idempotency-Key 正在处理中 | 返回已缓存响应 |
+
+---
+
+## 4. 数据模型
+
+### 4.1 API Key 存储
+
+```sql
+CREATE TABLE api_keys (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id           UUID NOT NULL REFERENCES auth_tenants(id),
+    api_key             VARCHAR(64) NOT NULL UNIQUE,
+    api_secret_hash     VARCHAR(64) NOT NULL,
+    app_name            VARCHAR(128) NOT NULL,
+    plan_type           VARCHAR(16) NOT NULL DEFAULT 'free'
+        CHECK (plan_type IN ('free', 'starter', 'professional', 'enterprise')),
+    scopes              JSONB NOT NULL DEFAULT '[]',
+    -- [修复5] 梯度 RPS 默认值（管理后台可按需调整）：
+    --   free:           10 RPS / 200 次月配额
+    --   starter:        50 RPS / 5,000 次月配额
+    --   professional: 100 RPS / 50,000 次月配额
+    --   enterprise:  1,000 RPS / 无限制配额（NULL）
+    rate_limit_rps      INTEGER NOT NULL DEFAULT 10,
+    rate_limit_burst    INTEGER NOT NULL DEFAULT 20,
+    monthly_quota       BIGINT,                        -- NULL = 无限制（enterprise）
+    monthly_used        BIGINT NOT NULL DEFAULT 0,      -- [修复2] 写操作必须原子 UPDATE
+    quota_reset_at      TIMESTAMPTZ,                    -- [修复3] 月度重置时间戳（UTC 每月1日 00:00）
+    allowed_ips         JSONB DEFAULT NULL,
+    enabled             BOOLEAN NOT NULL DEFAULT TRUE,
+    last_used_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by          UUID REFERENCES auth_users(id),
+    revoked_at          TIMESTAMPTZ,
+    revoked_by          UUID REFERENCES auth_users(id),
+    CONSTRAINT uq_tenant_app UNIQUE (tenant_id, app_name)
+);
+
+CREATE INDEX idx_api_keys_key ON api_keys(api_key);
+CREATE INDEX idx_api_keys_tenant ON api_keys(tenant_id, enabled);
+```
+
+**plan_type 与默认配额梯度对照表（[修复5]）：**
+
+| plan_type | rate_limit_rps | rate_limit_burst | monthly_quota | quota_reset_at 逻辑 |
+|-----------|---------------|-----------------|--------------|---------------------|
+| free | 10 | 20 | 200 | 每月1日 00:00 UTC 重置 |
+| starter | 50 | 100 | 5,000 | 每月1日 00:00 UTC 重置 |
+| professional | 100 | 200 | 50,000 | 每月1日 00:00 UTC 重置 |
+| enterprise | 1,000 | 2,000 | NULL（无上限） | 不重置 |
+
+> **说明：** `quota_reset_at` 默认逻辑为每月首日 00:00 UTC。实际重置由 cron 定时任务触发，详见 5.3 节。
+
+```sql
+CREATE TABLE api_call_logs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    api_key_id          UUID NOT NULL REFERENCES api_keys(id),
+    tenant_id           UUID NOT NULL REFERENCES auth_tenants(id),
+    request_id          VARCHAR(64) NOT NULL UNIQUE,
+    endpoint            VARCHAR(128) NOT NULL,
+    method              VARCHAR(8) NOT NULL,
+    status_code         INTEGER,
+    response_time_ms    INTEGER,
+    ip_address          INET,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_api_call_logs_key ON api_call_logs(api_key_id, created_at DESC);
+```
+
+### 4.2 配额计数器（Redis）+ 持久化策略
+
+**计数器 Key 设计：**
+
+```
+quota:daily:{api_key_id}       当日请求计数，TTL: 86400s（日配额自动过期）
+quota:monthly:{api_key_id}     当月请求计数，TTL: 自然月剩余秒数 + 604800s（7天缓冲）
+ratelimit:sdk:{api_key_id}     滑动窗口 RPS 计数，TTL: 60s
+idempotency:{sha256(key)}      Idempotency 缓存，TTL: 86400s
+```
+
+#### [修复1] Redis 持久化 + 降级策略
+
+**问题：** Redis 宕机时计数器丢失，导致配额统计错误。
+
+**架构：**
+
+```
+配额写入路径（正常）：
+  1. Redis INCR quota:daily / quota:monthly（优先，极高吞吐）
+  2. 后台任务每 5 分钟将 Redis 计数器刷回 PostgreSQL monthly_used
+  3. PostgreSQL monthly_used 作为持久化真相源（用于重置判断）
+
+Redis 宕机降级路径：
+  1. Redis ping 失败检测 → 自动降级到 PostgreSQL 原子 UPDATE
+  2. PostgreSQL 原子操作：
+     UPDATE api_keys
+     SET monthly_used = monthly_used + 1
+     WHERE id = $1
+       AND enabled = TRUE
+       AND (monthly_quota IS NULL OR monthly_used < monthly_quota)
+     RETURNING id
+  3. 降级期间临时降低限流阈值 50%（防止雪崩冲击数据库）
+  4. Redis 恢复后，一次性从 PostgreSQL 同步 monthly_used → Redis
+```
+
+**AOF 持久化配置（生产必须）：**
+
+```yaml
+# redis.conf
+appendonly yes
+appendfsync everysec     # 每秒刷盘，性能与持久化折中
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+# 建议配合 Redis Cluster + Sentinel 保障高可用
+```
+
+**灾难恢复流程：**
+1. Redis 宕机 → API 检测到 ping 失败，自动降级到 PostgreSQL 原子计数
+2. Redis 恢复 → 启动脚本从 PostgreSQL 读取 `monthly_used`，回填 Redis 计数器
+3. 数据不一致检测：后台任务定期比对 Redis 计数与 `monthly_used`（差异 > 1% 时告警）
+4. 手动修复：`sync_quota_from_db` 命令强制从 DB 同步到 Redis
+
+#### [修复2] monthly_used 原子性保证
+
+**所有配额/限流计数必须使用原子操作：**
+
+**Redis 原子 INCR（优先路径）：**
+
+```python
+# 日配额：INCR + TTL（TTL 自动过期实现日配额重置，[修复3]）
+key_daily = f"quota:daily:{api_key_id}"
+pipe = redis.pipeline()
+pipe.incr(key_daily)
+pipe.expire(key_daily, 86400)  # TTL = 24h，次日零点自动清零
+pipe.execute()
+
+# 月配额：INCR + 动态 TTL
+key_monthly = f"quota:monthly:{api_key_id}"
+ttl = get_seconds_until_month_end()
+pipe = redis.pipeline()
+pipe.incr(key_monthly)
+pipe.expire(key_monthly, ttl + 604800)  # 自然月剩余秒数 + 7天缓冲
+pipe.execute()
+```
+
+**PostgreSQL 原子 UPDATE（Redis 降级路径）：**
+
+```python
+async def increment_monthly_used_atomic(db, api_key_id: UUID) -> bool:
+    """
+    [修复2] PostgreSQL 原子 UPDATE：防止多实例并发导致配额超支。
+    条件 UPDATE（monthly_used < monthly_quota）确保不会超支。
+    """
+    row = await db.fetch_one(
+        """
+        UPDATE api_keys
+        SET monthly_used = monthly_used + 1,
+            last_used_at = NOW()
+        WHERE id = $1
+          AND enabled = TRUE
+          AND (monthly_quota IS NULL OR monthly_used < monthly_quota)
+        RETURNING id
+        """,
+        api_key_id
+    )
+    if not row:
+        quota_row = await db.fetch_one(
+            "SELECT monthly_quota, monthly_used FROM api_keys WHERE id = $1",
+            api_key_id
+        )
+        if quota_row and quota_row["monthly_quota"] is not None:
+            raise QuotaExceededError(
+                f"月度配额已用尽（{quota_row['monthly_used']}/{quota_row['monthly_quota']}）"
+            )
+        return True
+    return True
+```
+
+**RPS 滑动窗口（Redis Lua 原子脚本）：**
+
+```python
+LUA_RATELIMIT = (
+    "local key = KEYS[1] "
+    "local window = tonumber(ARGV[1]) "      # 滑动窗口秒数
+    "local limit = tonumber(ARGV[2]) "        # 限流阈值
+    "local now = tonumber(ARGV[3]) "
+    "redis.call('ZREMRANGEBYSCORE', key, 0, now - window * 1000) "
+    "local count = redis.call('ZCARD', key) "
+    "if count < limit then "
+    "  redis.call('ZADD', key, now, now .. ':' .. math.random()) "
+    "  redis.call('EXPIRE', key, window) "
+    "  return 1 "
+    "end "
+    "return 0 "
+)
+
+async def check_ratelimit(redis, api_key_id: str, rps: int, window: int = 1) -> bool:
+    key = f"ratelimit:sdk:{api_key_id}"
+    now_ms = int(time.time() * 1000)
+    result = await redis.eval(LUA_RATELIMIT, 1, key, window, rps, now_ms)
+    return result == 1
+```
+
+---
+
+## 5. SDK 客户端设计
+
+### 5.1 Python SDK 示例
+
+```python
+import time
+import hashlib
+import hmac
+import json
+import requests
+from typing import Optional
+
+
+class AuthMasterClient:
+    VERSION = "1.0.0"
+
+    # [修复5] 按 plan_type 梯度设置客户端侧限流保护（比服务端低 20% 留余量）
+    PLAN_RPS_LIMITS = {
+        "free": 8,
+        "starter": 40,
+        "professional": 80,
+        "enterprise": 800,
+    }
+
+    def __init__(self, api_key: str, api_secret: str,
+                 base_url: str = "https://auth.example.com/api/v1",
+                 timeout: int = 30, max_retries: int = 3,
+                 plan_type: str = "free"):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self._client_rps_limit = self.PLAN_RPS_LIMITS.get(plan_type, 8)
+        self._last_request_time = 0.0
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "AuthMaster-SDK-Python/1.0.0",
+            "Content-Type": "application/json",
+        })
+
+    def _sign(self, method: str, path: str, timestamp: int, body: str = "") -> str:
+        msg = method.upper() + path + str(timestamp) + body
+        return hmac.new(
+            self.api_secret.encode(), msg.encode(), hashlib.sha256
+        ).hexdigest()
+
+    def _client_side_ratelimit(self):
+        """[修复5] 客户端侧限流：确保不超出 plan_type 对应的 RPS 上限"""
+        min_interval = 1.0 / self._client_rps_limit
+        now = time.monotonic()
+        elapsed = now - self._last_request_time
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        self._last_request_time = time.monotonic()
+
+    def _request(self, method: str, path: str,
+                 data: Optional[dict] = None,
+                 idempotency_key: Optional[str] = None) -> dict:
+        self._client_side_ratelimit()
+        url = self.base_url + "/" + path.lstrip("/")
+        timestamp = int(time.time())
+        body = json.dumps(data) if data else ""
+        signature = self._sign(method, path, timestamp, body)
+        headers = {
+            "X-API-Key": self.api_key,
+            "X-API-Signature": signature,
+            "X-Timestamp": str(timestamp),
+        }
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        for attempt in range(self.max_retries):
+            resp = self._session.request(
+                method, url, json=data, headers=headers, timeout=self.timeout
+            )
+            if resp.status_code in (429, 500, 503):
+                resp.close()
+                time.sleep(2 ** attempt)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        raise AuthMasterError("Request failed after " + str(self.max_retries) + " attempts")
+
+    def login(self, username: str, password: str, **extra) -> dict:
+        """[修复4] 幂等性：非幂等，但支持 Idempotency-Key"""
+        return self._request("POST", "/sdk/auth/login",
+            {"username": username, "password": password, **extra},
+            idempotency_key=f"login:{username}")
+
+    def logout(self, session_id: str) -> dict:
+        """[修复4] 幂等性：幂等"""
+        return self._request("POST", "/sdk/auth/logout",
+            {"session_id": session_id},
+            idempotency_key=f"logout:{session_id}")
+
+    def refresh_token(self, refresh_token: str) -> dict:
+        return self._request("POST", "/sdk/auth/refresh",
+            {"refresh_token": refresh_token})
+
+    def list_users(self, page: int = 1, page_size: int = 20) -> dict:
+        return self._request("GET", "/sdk/users",
+            data={"filter": {"page": page, "page_size": page_size}})
+
+    def create_user(self, username: str, email: str, password: str, **kwargs) -> dict:
+        """[修复4] 幂等性：幂等（Idempotency-Key）"""
+        return self._request("POST", "/sdk/users",
+            {"username": username, "email": email, "password": password, **kwargs},
+            idempotency_key="create_user:" + username)
+
+    def get_user(self, user_id: str) -> dict:
+        return self._request("GET", "/sdk/users/" + user_id)
+
+    def update_user(self, user_id: str, **kwargs) -> dict:
+        """[修复4] 幂等性：幂等（Idempotency-Key）"""
+        return self._request("PUT", "/sdk/users/" + user_id, kwargs,
+            idempotency_key=f"update_user:{user_id}")
+
+    def patch_user(self, user_id: str, **kwargs) -> dict:
+        """[修复4] 幂等性：非幂等（PATCH 语义）"""
+        return self._request("PATCH", "/sdk/users/" + user_id, kwargs)
+
+    def delete_user(self, user_id: str) -> dict:
+        """[修复4] 幂等性：幂等"""
+        return self._request("DELETE", "/sdk/users/" + user_id,
+            idempotency_key=f"delete_user:{user_id}")
+
+    def list_roles(self) -> dict:
+        return self._request("GET", "/sdk/roles")
+
+    def create_role(self, name: str, description: str = "", **kwargs) -> dict:
+        """[修复4] 幂等性：幂等（Idempotency-Key）"""
+        return self._request("POST", "/sdk/roles",
+            {"name": name, "description": description, **kwargs},
+            idempotency_key="create_role:" + name)
+
+    def assign_permission(self, role_id: str, permission: str) -> dict:
+        """[修复4] 幂等性：幂等"""
+        return self._request("POST",
+            "/sdk/roles/" + role_id + "/permissions",
+            {"permission": permission},
+            idempotency_key=f"assign_perm:{role_id}:{permission}")
+
+    def get_quota(self) -> dict:
+        return self._request("GET", "/sdk/quota")
+
+
+class AuthMasterError(Exception):
+    def __init__(self, message: str = "", code: str = "",
+                 details: Optional[dict] = None):
+        self.code = code
+        self.message = message
+        self.details = details or {}
+        super().__init__(message)
+
+
+RETRY_CODES = {"TOKEN_EXPIRED", "RATE_LIMIT_EXCEEDED", "INTERNAL_ERROR", "SERVER_UNAVAILABLE"}
+NO_RETRY_CODES = {"INVALID_CREDENTIALS", "PERMISSION_DENIED", "NOT_FOUND", "VALIDATION_ERROR"}
+
+
+def auto_retry(max_attempts: int = 3, backoff_base: float = 2.0):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except AuthMasterError as e:
+                    if e.code in NO_RETRY_CODES or attempt == max_attempts - 1:
+                        raise
+                    if e.code in RETRY_CODES:
+                        time.sleep(backoff_base ** attempt)
+                        continue
+                    raise
+        return wrapper
+    return decorator
+```
+
+---
+
+## 6. 配额重置机制（[修复3] 新增）
+
+### 6.1 日配额重置（Redis TTL 自动过期）
+
+```python
+# 日配额：TTL = 86400s，次日零点自动清零，无需人工干预
+key = f"quota:daily:{api_key_id}"
+pipe = redis.pipeline()
+pipe.incr(key)
+pipe.expire(key, 86400)
+pipe.execute()
+```
+
+### 6.2 月配额重置（Cron 定时任务）
+
+每月 1 日 00:00 UTC（北京时间 08:00）触发定时任务：
+
+```python
+# cron: 0 0 1 * * (每月首日 00:00 UTC)
+async def reset_monthly_quotas():
+    """
+    [修复3] 定时重置月度配额：
+    1. 将所有 api_keys 的 monthly_used 重置为 0
+    2. 更新 quota_reset_at 为下月 1 日 00:00 UTC
+    3. 清空 Redis 月度配额计数器（quota:monthly:*）
+    4. 记录审计日志
+    """
+    async with db.transaction():
+        await db.execute("""
+            UPDATE api_keys
+            SET monthly_used = 0,
+                quota_reset_at = date_trunc('month', NOW())
+                                + interval '1 month'
+            WHERE plan_type != 'enterprise'
+              AND monthly_quota IS NOT NULL
+        """)
+        # 批量清空 Redis（避免逐个 DEL，使用 SCAN 迭代）
+        cursor = 0
+        while True:
+            cursor, keys = await redis.scan(cursor, match="quota:monthly:*", count=1000)
+            if keys:
+                await redis.delete(*keys)
+            if cursor == 0:
+                break
+
+        await audit_log.record(
+            event="monthly_quota_reset",
+            details={"reset_at": datetime.now(timezone.utc)}
+        )
+```
+
+**quota_reset_at 默认逻辑说明：**
+- 创建 API Key 时，`quota_reset_at = date_trunc('month', NOW()) + 1 month`（下月首日 00:00 UTC）
+- 每次 cron 重置成功后，更新为新的下月首日时间
+- Enterprise 套餐（`monthly_quota = NULL`）不受影响，`quota_reset_at` 为 NULL
+
+---
+
+## 7. 验收标准
+
+| ID | 验收条件 | 测试方式 |
+|----|---------|---------|
+| SDK-6.1 | Python/JS/Java/Go/PHP 五个语言 SDK 均可通过 pip install / npm install 等标准方式引入 | 手动测试 |
+| SDK-6.2 | SDK 响应与直接调 API 完全一致 | API 自动化测试 |
+| SDK-6.3 | SDK 内部自动处理 Token 刷新，对开发者透明 | 手动测试 |
+| SDK-6.4 | 限流时 SDK 自动退避重试，不抛异常到应用层 | 自动化测试 |
+| SDK-6.5 | 所有错误码有对应的 AuthMasterError 子类 | 单元测试 |
+| SDK-6.6 | 每个 API 方法均有使用示例（docstring） | 代码审查 |
+| SDK-6.7 | API Key 支持 scope 细粒度授权，越权操作返回 PERMISSION_DENIED | API 测试 |
+| SDK-6.8 | 月度配额用尽时返回 QUOTA_EXCEEDED，支持查询剩余配额 | API 测试 |
+| SDK-6.9 | 所有非幂等写操作均支持 Idempotency-Key | 自动化测试 |
+| SDK-6.10 | SDK 版本号公开，支持 client.version 访问 | 单元测试 |
+| SDK-6.11 | Redis 宕机后，配额计数自动降级到 PostgreSQL 原子 UPDATE | 故障注入测试 |
+| SDK-6.12 | 每月 1 日 00:00 UTC cron 任务正确重置 monthly_used | 定时任务测试 |
+| SDK-6.13 | 日配额通过 Redis TTL 自动过期，次日不累积 | Redis TTL 验证 |
+| SDK-6.14 | free/starter/professional/enterprise 四个套餐对应不同 RPS 阈值 | 配置验证 |
+
+---
+
+[PHASE2-6-END]
