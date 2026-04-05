@@ -38,7 +38,7 @@ class FakeResult:
     def __init__(self, rows=None, single=None, rowcount=1):
         self._rows = rows or []
         self._single = single
-        self._rowcount = rowcount
+        self.rowcount = rowcount
 
     async def fetchall(self):
         return self._rows
@@ -208,7 +208,8 @@ async def test_move_to_dead_letter_inserts():
     call_args = db_mock.execute.call_args
     sql_str = str(call_args[0][0])
     assert "logout_dead_letters" in sql_str
-    assert "Connection refused" in sql_str
+    # Error message is in params, not the SQL string itself
+    assert call_args[0][1]["err"] == "Connection refused"
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +235,8 @@ async def test_alert_logout_failure_calls_alert_service():
     alert_mock.send.assert_called_once()
     call_kwargs = alert_mock.send.call_args[1]
     assert call_kwargs["level"] == "critical"
-    assert "dead_letter" in call_kwargs["title"]
+    # Title contains "死信" (dead letter in Chinese)
+    assert "死信" in call_kwargs["title"]
 
 
 # ---------------------------------------------------------------------------

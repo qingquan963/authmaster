@@ -38,7 +38,7 @@ class FakeResult:
     def __init__(self, rows=None, single=None, rowcount=0):
         self._rows = rows or []
         self._single = single
-        self._rowcount = rowcount
+        self.rowcount = rowcount  # NOT _rowcount
 
     async def fetchall(self):
         return self._rows
@@ -61,13 +61,13 @@ async def test_cleanup_deletes_old_dead_letters():
     created_at < NOW() - INTERVAL '30 days'.
     """
     db_mock = AsyncMock()
-    deleted_count = 0
+    delete_called = False
 
     async def fake_execute(query, params=None):
-        nonlocal deleted_count
+        nonlocal delete_called
         sql_str = str(query)
         if "DELETE FROM logout_dead_letters" in sql_str:
-            deleted_count = 5
+            delete_called = True
             return FakeResult(rowcount=5)
         return FakeResult(rowcount=0)
 
@@ -76,11 +76,7 @@ async def test_cleanup_deletes_old_dead_letters():
 
     result = await sso_service.cleanup_dead_letter_ttl(db_mock)
 
-    assert deleted_count >= 0  # Either 0 or 5 depending on timing
-    # Verify DELETE query uses correct cutoff
-    call_args = db_mock.execute.call_args_list
-    delete_calls = [c for c in call_args if "DELETE FROM" in str(c)]
-    assert len(delete_calls) >= 1
+    assert delete_called is True
 
 
 # ---------------------------------------------------------------------------
