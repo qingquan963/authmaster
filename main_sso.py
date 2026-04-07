@@ -73,6 +73,43 @@ class FakeResult:
     async def fetchone(self):
         return self._single
 
+    async def scalar(self):
+        """Return the first column of the first row (mimics SQLAlchemy Result.scalar())."""
+        if self._single is not None:
+            if hasattr(self._single, '_mapping'):
+                vals = list(self._single._mapping.values())
+            elif isinstance(self._single, dict):
+                vals = list(self._single.values())
+            else:
+                return self._single
+            return vals[0] if vals else None
+        if self._rows:
+            row = self._rows[0]
+            if hasattr(row, '_mapping'):
+                vals = list(row._mapping.values())
+            elif isinstance(row, dict):
+                vals = list(row.values())
+            else:
+                return row
+            return vals[0] if vals else None
+        return None
+
+    def scalars(self):
+        """Return a fake scalars proxy with .all() and .first()."""
+        return FakeScalars(self._rows)
+
+
+class FakeScalars:
+    """Fake scalars result for db.execute().scalars()."""
+    def __init__(self, rows):
+        self._rows = rows or []
+
+    async def all(self):
+        return self._rows
+
+    async def first(self):
+        return self._rows[0] if self._rows else None
+
 
 class MockAsyncSession:
     """In-memory async DB session mock for demo/testing."""

@@ -425,7 +425,7 @@ async def list_dead_letters(
     offset = (page - 1) * page_size
 
     total_result = await db.execute(text("SELECT COUNT(*) FROM logout_dead_letters"))
-    total = total_result.scalar() or 0
+    total = await total_result.scalar() or 0
 
     result = await db.execute(
         text("""

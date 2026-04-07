@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS rate_limit_rules (
     -- Max requests allowed per window
     rate                INTEGER NOT NULL,
     -- Window size in seconds
-    window              INTEGER NOT NULL,
+    window_sec              INTEGER NOT NULL,
     -- Burst capacity for token bucket (optional, defaults to rate * 2)
     burst               INTEGER,
     -- Whether this rule is active
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS rate_limit_rules (
         UNIQUE (tenant_id, endpoint_pattern, key_type),
     -- Rate and window must be positive
     CONSTRAINT ck_rate_positive CHECK (rate > 0),
-    CONSTRAINT ck_window_positive CHECK (window > 0),
+    CONSTRAINT ck_window_positive CHECK (window_sec > 0),
     CONSTRAINT ck_key_type CHECK (key_type IN ('ip', 'user', 'api_key', 'tenant', 'global'))
 );
 
@@ -68,7 +68,7 @@ COMMENT ON COLUMN rate_limit_rules.priority IS
 -- ---------------------------------------------------------------------------
 -- Pre-configured rules for common endpoints
 
-INSERT INTO rate_limit_rules (endpoint_pattern, key_type, rate, window, burst, priority, extra_config) VALUES
+INSERT INTO rate_limit_rules (endpoint_pattern, key_type, rate, window_sec, burst, priority, extra_config) VALUES
     -- Login endpoint: 5 attempts per minute per IP (strict)
     ('/api/v1/auth/login', 'ip', 5, 60, 10, 100,
      '{"strategy": "sliding_window", "description": "Login attempts per IP"}'),
